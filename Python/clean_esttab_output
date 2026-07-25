@@ -1,0 +1,149 @@
+"""
+Utilities for cleaning Stata `esttab ... , csv` output.
+
+esttab wraps every cell in ="..." to force Excel/Numbers to treat it as
+literal text (avoiding auto-reformatting of negative numbers, dates, etc.).
+This is helpful in Excel but means the raw CSV is not directly usable in
+Python/pandas without stripping this wrapper first. These functions were
+used throughout the dissertation to turn raw reghdfe/esttab CSV exports
+into clean pandas DataFrames for reporting in text and tables.
+"""
+
+import re
+import pandas as pd
+
+
+def strip_stata_wrapper(val):
+    """Remove the ="..." Excel-text-escape wrapper esttab adds to every cell."""
+    if pd.isna(val):
+        return ""
+    s = str(val)
+    m = re.match(r'^="?(.*?)"?$', s)
+    if m:
+        s = m.group(1)
+    return s.strip()
+
+
+def clean_raw_csv(path: str) -> pd.DataFrame:
+    """Read an esttab CSV export and return a DataFrame with the ="..."
+    wrapper stripped from every cell, with no assumptions about header
+    row position (esttab's own header row is usually junk column numbers,
+    not variable names)."""
+    raw = pd.read_csv(path, header=None, dtype=str)
+    raw = raw.apply(lambda col: col.map(strip_stata_wrapper))
+    return raw
+
+
+def parse_descriptive_stats_panel(path: str, panel_labels: dict) -> pd.DataFrame:
+    """
+    Parse a Table 4.1-style descriptive statistics export where multiple
+    country/sample panels have been concatenated with a manually-inserted
+    "Panel X: ..." label row between each block (see merge_table_4_1.py
+    for how those label rows are inserted).
+
+    panel_labels: dict mapping the literal label text used in the "Panel"
+    rows to a cleaner display name (mostly a passthrough here, but kept
+    for symmetry with how the label rows were generated).
+    """
+    raw = clean_raw_csv(path)
+    rows = []
+    current_panel = None
+    i = 0
+    while i < len(raw):
+        first_cell = raw.iloc[i, 0]
+        if first_cell.startswith("Panel"):
+            current_panel = first_cell
+            i += 1
+            continue
+        if first_cell == "" and str(raw.iloc[i, 1]).lower() == "mean":
+            i += 1
+            while i < len(raw) and not raw.iloc[i, 0].startswith("Panel") and raw.iloc[i, 0] != "":
+                var_name = raw.iloc[i, 0]
+                mean, sd, mn, p50, mx = raw.iloc[i, 1:6]
+                rows.append([current_panel, var_name, mean, sd, mn, p50, mx])
+                i += 1
+            continue
+        i += 1
+    return pd.DataFrame(rows, columns=["Panel", "Variable", "Mean", "SD", "Min", "Median", "Max"])
+
+
+def parse_correlation_matrix(path: str) -> pd.DataFrame:
+    """Parse an esttab-exported lower-triangular correlation matrix
+    (as produced by `estpost correlate ..., matrix` + `esttab`)."""
+    raw = clean_raw_csv(path)
+
+    header_row_idx, best_count = None, 0
+    for i in range(len(raw)):
+        if raw.iloc[i, 0] == "":
+            non_empty = sum(1 for v in raw.iloc[i, 1:].tolist() if v != "")
+            if non_empty > best_count:
+                best_count = non_empty
+                header_row_idx = i
+
+    varnames = [v for v in raw.iloc[header_row_idx, 1:].tolist() if v != ""]
+    n = len(varnames)
+
+    data_rows = []
+    for i in range(header_row_idx + 1, header_row_idx + 1 + n):
+        row = raw.iloc[i].tolist()[:n + 1]
+        data_rows.append(row)
+
+    return pd.DataFrame(data_rows, columns=["Variable"] + varnames)
+
+
+def parse_wide_regression_table(path: str, model_names: list) -> pd.DataFrame:
+    """
+    Parse a wide, multi-model esttab regression export (coefficient row
+    followed by a standard-error row in parentheses, for each variable),
+    returning a single DataFrame with "coef (se)" strings per model column.
+
+    model_names must list the models in the same left-to-right order they
+    appear in the underlying `esttab model1 model2 ... using file.csv` call.
+    """
+    import csv
+
+    STAT_ROWS = {"N", "Clusters", "Within R2"}
+
+    with open(path, newline="", encoding="utf-8") as f:
+        raw_rows = [[strip_stata_wrapper(cell) for cell in row] for row in csv.reader(f)]
+
+    ncols = max(len(r) for r in raw_rows)
+    raw_rows = [r + [""] * (ncols - len(r)) for r in raw_rows]
+
+    records, stats = {}, {}
+    i, n_rows = 0, len(raw_rows)
+    while i < n_rows:
+        row = raw_rows[i]
+        first = row[0] if row else ""
+        if first == "" or first.startswith("Standard errors") or first.startswith("* p<"):
+            i += 1
+            continue
+        if first in STAT_ROWS:
+            stats[first] = dict(zip(model_names, row[1:1 + len(model_names)]))
+            i += 1
+            continue
+        coef_row = row[1:1 + len(model_names)]
+        se_row = [""] * len(model_names)
+        if i + 1 < n_rows and (len(raw_rows[i + 1]) == 0 or raw_rows[i + 1][0] == ""):
+            se_candidate = raw_rows[i + 1][1:1 + len(model_names)]
+            if any(v.startswith("(") for v in se_candidate if v):
+                se_row = se_candidate
+                i += 1
+        combined = [f"{c} {s}".strip() if (c or s) else "" for c, s in zip(coef_row, se_row)]
+        records[first] = dict(zip(model_names, combined))
+        i += 1
+
+    full_table = pd.DataFrame.from_dict(records, orient="index")
+    full_table = pd.concat([full_table, pd.DataFrame.from_dict(stats, orient="index")])
+    full_table = full_table[model_names]
+    full_table.index.name = "Variable"
+    return full_table
+
+
+if __name__ == "__main__":
+    # Example: parsing the 9-model robustness/AI-period regression export
+    model_names = ["M1_main", "M2_fullsample", "M3_covid_ai", "M3b_no_overlap",
+                    "M4_cgo", "M5_winsorized", "M6_lagged", "M7_market_adjusted",
+                    "M8_covid_amplify_ai"]
+    table = parse_wide_regression_table("regression_summary_full.csv", model_names)
+    print(table.to_string())
