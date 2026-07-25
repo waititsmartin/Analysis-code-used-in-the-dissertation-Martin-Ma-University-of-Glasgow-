@@ -1,0 +1,49 @@
+* ============================================================
+* Table 4.1 & 4.2 — Descriptive Statistics and Correlation Matrix
+* Input: master_panel_30.csv
+* ============================================================
+
+clear all
+import delimited "master_panel_30.csv", clear varnames(1)
+
+gen log_weekly_volume = ln(weekly_volume)
+
+* ---- Restrict to the estimation sample: TA, both Z-scores, and all
+* ---- controls jointly non-missing (matches the sample used in Ch.4) ----
+gen in_estimation_sample = !missing(turnover_asymmetry) & !missing(svi_zscore_rolling52w) & !missing(svi_zscore_fullsample) & !missing(weekly_volatility) & !missing(market_return)
+
+keep if in_estimation_sample == 1
+
+* ============================================================
+* Table 4.1: Descriptive Statistics — Panel A (Full Sample)
+* ============================================================
+estpost summarize turnover_asymmetry svi_zscore_rolling52w svi_zscore_fullsample weekly_log_return weekly_volatility market_return, detail
+
+esttab using "table_4_1_panelA_fullsample.csv", replace cells("mean sd min p50 max") label noobs csv
+
+* ============================================================
+* Table 4.1: Descriptive Statistics — Panel B/C/D (by country)
+* ============================================================
+foreach c in US JP CN {
+    preserve
+    keep if country == "`c'"
+    estpost summarize turnover_asymmetry svi_zscore_rolling52w svi_zscore_fullsample weekly_log_return weekly_volatility market_return, detail
+    esttab using "table_4_1_panel_`c'.csv", replace cells("mean sd min p50 max") label noobs csv
+    restore
+}
+
+* ============================================================
+* Table 4.2: Pairwise Correlation Matrix (Full Sample)
+* ============================================================
+estpost correlate turnover_asymmetry svi_zscore_rolling52w svi_zscore_fullsample weekly_log_return weekly_volatility market_return, matrix
+
+esttab using "table_4_2_correlation.csv", replace unstack not noobs compress csv
+
+* ============================================================
+* Outlier check (referenced in Section 4.1: "96 extreme observations")
+* ============================================================
+quietly summarize turnover_asymmetry
+scalar ta_mean = r(mean)
+scalar ta_sd = r(sd)
+count if abs(turnover_asymmetry - ta_mean) > 4*ta_sd
+display "TA observations beyond 4 SD: " r(N)
